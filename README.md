@@ -10,7 +10,7 @@ https://github.com/xwj01/CTLIB
 Then:
 
 ```
-pip install -r requrements.txt
+pip install -r requirements.txt
 python setup.py install
 
 ```
