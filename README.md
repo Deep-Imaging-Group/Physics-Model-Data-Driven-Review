@@ -7,4 +7,10 @@ Before using this code, please install our library for CT reconstruction:
 
 https://github.com/xwj01/CTLIB
 
+Then:
 
+```
+pip install -r requrements.txt
+python setup.py install
+
+```
