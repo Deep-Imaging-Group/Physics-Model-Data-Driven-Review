@@ -7,7 +7,7 @@ Before using this code, please install our library for CT reconstruction:
 
 https://github.com/xwj01/CTLIB
 
-Then:
+Then type:
 
 ```
 pip install -r requirements.txt
