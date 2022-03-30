@@ -1,0 +1,104 @@
+{
+    "epochs": {
+        "type": "int",
+        "help": "Max traning epochs",
+        "default": 200},
+    "batch_size": {
+        "type": "int",
+        "help": "Batch size of training data",
+        "default": 4},
+    "lr": {
+        "type": "float",
+        "help": "Learning rate",
+        "default": 1e-4},
+    "gpus": {
+        "type": "int",
+        "help": "Number of GPUs",
+        "default": 1},
+    "gpu_ids": {
+        "type": "int",
+        "help": "GPU IDs",
+        "nargs": "+",
+        "default": [0]},
+    "is_specified_gpus": {
+        "type": "bool",
+        "help": "Whether use the specified GPUs",
+        "default": false},
+    "cpus": {
+        "type": "int",
+        "help": "Number of CPUs",
+        "default": 4},
+    "data_root_dir": {
+        "type": "str",
+        "help": "Root dir of data",
+        "default": "/mnt/nfs-data-storage/xwj/dataset/mayo_low_dose_512"},
+    "dose": {
+        "type": "str",
+        "help": "Dose of low-dose CT",
+        "default": "25%"},
+    "is_vis_show": {
+        "type": "bool",
+        "help": "Whether show the loss curve and res with visdom",
+        "default": false},
+    "show_win": {
+        "type": "float",
+        "help": "Show window of the res",
+        "nargs": "+",
+        "default": [1.6128, 2.3808]},
+    "is_res_save": {
+        "type": "bool",
+        "help": "Whether save the test res",
+        "default": true},
+    "res_dir": {
+        "type": "str",
+        "help": "The dir to save the test res",
+        "default": "result"},
+    "views": {
+        "type": "int",
+        "help": "Number of projection views",
+        "default": 512},
+    "dets": {
+        "type": "int",
+        "help": "Number of detector elements",
+        "default": 736},
+    "width": {
+        "type": "int",
+        "help": "Width of image",
+        "default": 512},
+    "height": {
+        "type": "int",
+        "help": "Height of image",
+        "default": 512},
+    "dImg": {
+        "type": "float",
+        "help": "Physical size of a pixel",
+        "default": 0.006641},
+    "dDet": {
+        "type": "float",
+        "help": "Physical size of a detector element",
+        "default": 0.012858},
+    "Ang0": {
+            "type": "float",
+            "help": "Start angle",
+            "default": 0},
+    "dAng": {
+        "type": "float",
+        "help": "Rad interval between two views",
+        "default": 0.012268},
+    "s2r": {
+        "type": "float",
+        "help": "Distance between x-ray soruce and rotation center",
+        "default": 5.95},
+    "d2r": {
+        "type": "float",
+        "help": "Distance between x-ray soruce and rotation center",
+        "default": 4.906},
+    "binshift": {
+        "type": "float",
+        "help": "Shift of detector",
+        "default": 0},
+    "scan_type": {
+        "type": "int",
+        "help": "Scannint type, 0: equal distance fan beam, 1: euqal angle fan beam, 2: parallel beam",
+        "default": 0}
+}

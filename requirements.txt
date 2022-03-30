@@ -1,0 +1,6 @@
+pycuda
+scipy
+numpy
+torch
+pytorch-lightning
+visdom
