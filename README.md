@@ -14,3 +14,6 @@ pip install -r requirements.txt
 python setup.py install
 
 ```
+
+The dataset can be access on:
+https://drive.google.com/file/d/1WocZQo7f4Zx8wlrHywMNlUMtiQUCjPfA/view?usp=sharing
