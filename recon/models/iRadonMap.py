@@ -223,7 +223,7 @@ class rCNN(nn.Module):
         super().__init__()
         layers = []
         layers.append(nn.Conv2d(1, 64, 3, 1, 1))
-        # layers.append(nn.GroupNorm(num_channels=64, num_groups=1, affine=False))
+        layers.append(nn.GroupNorm(num_channels=64, num_groups=1, affine=False))
         layers.append(nn.ReLU())
         for i in range(11):
             layers.append(block())
