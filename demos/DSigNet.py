@@ -1,137 +1,158 @@
-import os
-import glob
-import json
-import argparse
-import scipy.io as scio
-import numpy as np
 import torch
-import torch.nn.functional as F
-import pytorch_lightning as pl
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
-from pytorch_lightning.callbacks import ModelCheckpoint
-from recon.models import DSigNet
-from vis_tools import Visualizer
+import torch.nn as nn
+import math
+import numpy as np 
+from torch.autograd import Function
+from .iRadonMap import PixelIndexCal_cuda
+from .iRadonMap import BackProjNet
 
-def setup_parser(arguments, title):
-    parser = argparse.ArgumentParser(description=title,
-                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    for key, val in arguments.items():
-        parser.add_argument('--%s' % key,
-                            type=eval(val["type"]),
-                            help=val["help"],
-                            default=val["default"],
-                            nargs=val["nargs"] if "nargs" in val else None)
-    return parser
+def PixelIndexCal_DownSampling(length, width, lds, wds):
+    length, width = int(length/lds), int(width/wds)
+    ds_indices = torch.zeros(lds*wds, width*length).type(torch.LongTensor)
+    for x in range(lds):
+        for y in range(wds):
+            k = x*width*wds+y
+            for z in range(length):
+                i, j = z*width, x*wds+y
+                st = k+z*width*wds*lds
+                ds_indices[j, i:i+width] = torch.tensor(range(st,st+width*wds, wds))
+    return ds_indices.view(-1)
 
-def get_parameters(title=None):
-    with open("config.json") as data_file:
-        data = json.load(data_file)
-    parser = setup_parser(data, title)
-    parameters = parser.parse_args()
-    return parameters
 
-class net(pl.LightningModule):
-    def __init__(self, args):
-        super().__init__()
-        options = torch.tensor([args.views, args.dets, args.width, args.height,
-                                args.dImg, args.dDet, args.Ang0, args.dAng,
-                                args.s2r, args.d2r, args.binshift, args.scan_type])
-        self.model = DSigNet(options)
-        self.epochs = args.epochs
-        self.lr = args.lr
-        self.is_vis_show = args.is_vis_show
-        self.show_win = args.show_win
-        self.is_res_save = args.is_res_save
-        self.res_dir = args.res_dir        
-        if self.is_vis_show:
-            self.vis = Visualizer(env='DSigNet')
+def PixelIndexCal_UpSampling(index, length, width):
+    index = index.view(-1)
+    _, ups_indices = index.sort(dim=0, descending=False)
+    return ups_indices.view(-1)        
 
-    def forward(self, p):
-        out = self.model(p)
-        return out
+class DownSamplingBlock(nn.Module):
+    def __init__(self, planes=8, length=512, width=736, lds=2, wds=2):
+        super(DownSamplingBlock, self).__init__()
+        self.length = int(length/lds)
+        self.width = int(width/wds)
+        self.extra_channel = lds*wds
+        self.ds_index = nn.Parameter(PixelIndexCal_DownSampling(length, width, lds, wds), requires_grad=False)
+        self.filter = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=True)
+        self.ln = nn.GroupNorm(num_channels=planes, num_groups=1, affine=False)
+        self.leakyrelu = nn.LeakyReLU(0.2, True)
 
-    def training_step(self, batch, batch_idx):
-        x, p, y = batch
-        out = self(p)
-        loss = F.mse_loss(out, y)
-        self.log("train_loss", loss, on_step=True, on_epoch=True)
-        if self.is_vis_show:
-            self.vis_show(loss.detach(), x.detach(), y.detach(), out.detach())
-        return loss
-    
-    def validation_step(self, batch, batch_idx):
-        x, p, y = batch
-        out = self(p)
-        loss = F.mse_loss(out, y)
-        self.log("val_loss", loss)
+    def forward(self, input):
+        _, channel, length, width = input.size()
+        output = torch.index_select(input.view(-1, channel, length*width), 2, self.ds_index)
+        output = output.view(-1, channel*self.extra_channel, self.length, self.width)
+        output = self.leakyrelu(self.ln(self.filter(output)))
 
-    def test_step(self, batch, batch_idx):
-        x, p, y, res_name = batch
-        out = self(p)
-        if self.is_res_save:
-            self.res_save(out, res_name)
+        return output
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000)
-        return [optimizer], [scheduler]     
 
-    def show_win_norm(self, y):
-        x = y.clone()
-        x[x<self.show_win[0]] = self.show_win[0]
-        x[x>self.show_win[1]] = self.show_win[1]
-        x = (x - self.show_win[0]) / (self.show_win[1] - self.show_win[0]) * 255
-        return x
+class UpSamplingBlock(nn.Module):
+    def __init__(self, planes=8, length=64, width=64, lups=2, wups=2):
+        super(UpSamplingBlock, self).__init__()
 
-    def vis_show(self, loss, x, y, out, mode='Train'):
-        self.vis.plot(mode + ' Loss', loss.item())
-        self.vis.img(mode + ' Ground Truth', self.show_win_norm(y).cpu())
-        self.vis.img(mode + ' Input', self.show_win_norm(x).cpu())
-        self.vis.img(mode + ' Result', self.show_win_norm(out).cpu())
-
-    def res_save(self, out, res_name):
-        res = out.cpu().numpy()
-        if not os.path.exists(self.res_dir):
-            os.mkdir(self.res_dir)
-        for i in range(res.shape[0]):
-            scio.savemat(self.res_dir + '/' + res_name[i], {'data':res[i].squeeze()})
-
-class data_loader(Dataset):
-    def __init__(self, root, dose, mode):
-        self.x_dir_name = 'input_' + dose
-        self.x_path = os.path.join(root, mode, self.x_dir_name)        
-        self.mode = mode
-        self.files_x = np.array(sorted(glob.glob(os.path.join(self.x_path, 'data') + '*.mat')))
+        self.length = length*lups
+        self.width = width*wups
+        self.extra_channel = lups*wups
+        ds_index = PixelIndexCal_DownSampling(self.length, self.width, lups, wups)
+        self.ups_index = nn.Parameter(PixelIndexCal_UpSampling(ds_index, self.length, self.width), requires_grad=False)
+        self.filter = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=True)
+        self.ln = nn.GroupNorm(num_channels=planes, num_groups=1, affine=False)
+        self.leakyrelu = nn.LeakyReLU(0.2, True)
         
-    def __getitem__(self, index):
-        file_x = self.files_x[index]
-        file_p = file_x.replace('input', 'projection')
-        file_y = file_x.replace(self.x_dir_name, 'label')
-        input_data = scio.loadmat(file_x)['data']
-        prj_data = scio.loadmat(file_p)['data']
-        label_data = scio.loadmat(file_y)['data']
-        input_data = torch.FloatTensor(input_data).unsqueeze_(0)
-        prj_data = torch.FloatTensor(prj_data).unsqueeze_(0)
-        label_data = torch.FloatTensor(label_data).unsqueeze_(0)
-        if self.mode == 'train' or self.mode == 'vali':
-            return input_data, prj_data, label_data
-        elif self.mode == 'test':
-            res_name = file_x[-13:]
-            return input_data, prj_data, label_data, res_name
+    def forward(self, input):
+        _, channel, length, width = input.size()
+        channel = int(channel/self.extra_channel)
+        output = torch.index_select(input.view(-1, channel, self.extra_channel*length*width), 2, self.ups_index)
+        output = output.view(-1, channel, self.length, self.width)
+        output = self.leakyrelu(self.ln(self.filter(output)))
 
-    def __len__(self):
-        return len(self.files_x)
-    
-if __name__ == "__main__":
-    args = get_parameters()
-    network = net(args)
-    checkpoint_callback = ModelCheckpoint(monitor="val_loss", save_last=True, save_top_k=3, mode="min")
-    trainer = pl.Trainer(gpus=args.gpu_ids if args.is_specified_gpus else args.gpus, log_every_n_steps=1, max_epochs=args.epochs, callbacks=[checkpoint_callback])
-    train_loader = DataLoader(data_loader(args.data_root_dir, args.dose, 'train'), batch_size=args.batch_size, shuffle=True, num_workers=args.cpus)
-    vali_loader = DataLoader(data_loader(args.data_root_dir, args.dose, 'vali'), batch_size=args.batch_size, shuffle=False, num_workers=args.cpus)
-    test_loader = DataLoader(data_loader(args.data_root_dir, args.dose, 'test'), batch_size=args.batch_size, shuffle=False, num_workers=args.cpus)
-    trainer.fit(network, train_loader, vali_loader)
-    # trainer.fit(network, train_loader, vali_loader, ckpt_path='lightning_logs/version_0/checkpoints/last.ckpt')
-    trainer.test(network, test_loader, ckpt_path='best')
-    
+        return output
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, planes):
+        super(ResidualBlock, self).__init__()
+
+        self.filter1 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=True)
+        self.ln1 = nn.GroupNorm(num_channels=planes, num_groups=1, affine=False)
+        self.leakyrelu1 = nn.LeakyReLU(0.2, True)
+        self.filter2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=True)
+        self.ln2 = nn.GroupNorm(num_channels=planes, num_groups=1, affine=False)
+        self.leakyrelu2 = nn.LeakyReLU(0.2, True)
+
+    def forward(self, input):
+        output = self.leakyrelu1(self.ln1(self.filter1(input)))
+        output = self.ln2(self.filter2(output))
+        output += input
+        output = self.leakyrelu2(output)
+
+        return output
+
+
+class SinoNet(nn.Module):
+    def __init__(self, bp_channel, num_filters):
+        super(SinoNet, self).__init__()
+
+        model_list  = [nn.Conv2d(1, num_filters, kernel_size=3, stride=1, padding=1, bias=True), nn.GroupNorm(num_channels=num_filters, num_groups=1, affine=False), nn.LeakyReLU(0.2, True)]
+        model_list += [DownSamplingBlock(planes=num_filters*4, length=512, width=736, lds=2, wds=2)]
+        model_list += [ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4)]
+        model_list += [ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4)]
+        model_list += [ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4)]
+        model_list += [ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4)]
+        
+        model_list += [nn.Conv2d(num_filters*4, bp_channel, kernel_size=1, stride=1, padding=0, bias=True)]
+        self.model = nn.Sequential(*model_list)
+
+    def forward(self, input):
+
+        return self.model(input)
+
+class SpatialNet(nn.Module):
+    def __init__(self, bp_channel, num_filters):
+        super(SpatialNet, self).__init__()
+
+        model_list  = [nn.Conv2d(bp_channel, num_filters*4, kernel_size=3, stride=1, padding=1, bias=True), nn.GroupNorm(num_channels=num_filters*4, num_groups=1, affine=False), nn.LeakyReLU(0.2, True)]
+        model_list += [ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4)]
+        model_list += [ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4)]
+        model_list += [ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4)]
+        model_list += [ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4), ResidualBlock(planes=num_filters*4)]
+        model_list += [UpSamplingBlock(planes=num_filters, length=256, width=256, lups=2, wups=2)]
+        
+        model_list += [nn.Conv2d(num_filters, 1, kernel_size=1, stride=1, padding=0, bias=True)]
+        self.model = nn.Sequential(*model_list)
+
+    def forward(self, input):
+
+        return self.model(input)
+
+class DSigNet(nn.Module):
+    def __init__(self, options, bp_channel=4, num_filters=16, scale_factor=2) -> None:
+        super().__init__()
+        geo_real = {'nVoxelX': int(options[2]), 'sVoxelX': float(options[4]) * int(options[2]), 'dVoxelX': float(options[4]), 
+            'nVoxelY': int(options[3]), 'sVoxelY': float(options[4]) * int(options[3]), 'dVoxelY': float(options[4]), 
+            'nDetecU': int(options[1]), 'sDetecU': float(options[5]) * int(options[1]), 'dDetecU': float(options[5]), 
+            'offOriginX': 0.0, 'offOriginY': 0.0, 
+            'views': int(options[0]), 'slices': 1,
+            'DSD': float(options[8]) + float(options[9]), 'DSO': float(options[8]), 'DOD': float(options[9]),
+            'start_angle': 0.0, 'end_angle': float(options[7]) * int(options[0]),
+            'mode': 'fanflat', 'extent': 1, # currently extent supports 1, 2, or 3.
+            }
+        geo_virtual = dict()
+        geo_virtual.update({x: int(geo_real[x]/scale_factor) for x in ['views']})
+        geo_virtual.update({x: int(geo_real[x]/scale_factor) for x in ['nVoxelX', 'nVoxelY', 'nDetecU']})
+        geo_virtual.update({x: geo_real[x]/scale_factor for x in ['sVoxelX', 'sVoxelY', 'sDetecU', 'DSD', 'DSO', 'DOD', 'offOriginX', 'offOriginY']})
+        geo_virtual.update({x: geo_real[x] for x in ['dVoxelX', 'dVoxelY', 'dDetecU', 'slices', 'start_angle', 'end_angle', 'mode', 'extent']})
+        geo_virtual['indices'], geo_virtual['weights'] = PixelIndexCal_cuda(geo_virtual)
+        self.SinoNet = SinoNet(bp_channel, num_filters)
+        self.BackProjNet = BackProjNet(geo_virtual, bp_channel)
+        self.SpatialNet = SpatialNet(bp_channel, num_filters)
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+
+    def forward(self, input):
+        output = self.SinoNet(input)
+        output = self.BackProjNet(output)
+        output = self.SpatialNet(output)
+        return output
+
